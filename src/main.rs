@@ -3,7 +3,6 @@ extern crate num_derive;
 extern crate core;
 
 mod btmsg;
-mod bencode;
 mod torrent;
 
 use std::cmp::{max, min, Ordering};
@@ -17,9 +16,13 @@ use std::thread;
 use hex_literal::hex;
 use itertools::Itertools;
 use libc::{c_int, c_void, EFD_SEMAPHORE, epoll_create, epoll_ctl, EPOLL_CTL_ADD, epoll_event, epoll_wait, EPOLLIN, eventfd, off_t, read, size_t, ssize_t, write};
-use crate::torrent::Torrent;
+use nix::sys::uio::pwrite;
+use crate::torrent::{BackingStore, Piece, Torrent};
 use sha1_smol::Sha1;
-use crate::btmsg::{BtMsg, recv_and_check_handshake, send_handshake};
+use crate::btmsg::BtMsg;
+
+static BLOCK_SIZE : u32 = 0x4000;
+static MAX_BLOCKS_IN_FLIGHT : u32 = 10;
 
 enum TM2PMCmd {
     DownloadPiece(Piece),
@@ -27,22 +30,6 @@ enum TM2PMCmd {
 
 enum PM2TMResult {
     FinishedDownloadingPiece(u32)
-}
-
-struct Piece {
-    // this piece_idx ...
-    piece_idx: u32,
-    piece_len: u32,
-    piece_hash: [u8; 20],
-    // ... is at these coordinates in the filesystem:
-    fd: c_int,
-    offset: usize,
-}
-
-impl Piece {
-    fn n_blocks(&self) -> u32 {
-        self.piece_len / BLOCK_SIZE + if (self.piece_len % BLOCK_SIZE) > 0 {1} else {0}
-    }
 }
 
 struct BlockReq {
@@ -69,8 +56,6 @@ struct PieceInFlight {
     ready_blks: Vec<BlockResp>,
     unasked_blks: Vec<BlockReq>,
 }
-
-static BLOCK_SIZE : u32 = 0x4000;
 
 impl PieceInFlight {
     // This structure is a bit wonky. Explained:
@@ -116,9 +101,63 @@ impl PieceInFlight {
         // TODO: assert that the block is neither in unasked_blks nor in ready_blks
         self.ready_blks.push(resp);
     }
-    
+
     pub fn is_completely_downloaded(&self) -> bool {
         self.piece.n_blocks() as usize == self.ready_blks.len()
+    }
+}
+
+struct Chunk<'a, 'b> {
+    blk: &'a BlockResp,
+    blk_start: usize,
+    bs: &'b BackingStore,
+    bs_start: usize,
+    len: usize,
+}
+
+impl<'a, 'b> Chunk<'a, 'b> {
+    pub fn combine_shit<BLKS, BSS>(mut blocks: BLKS, mut backing_stores: BSS) -> Vec<Chunk<'a, 'b>>
+        where BLKS: Iterator<Item=&'a BlockResp>,
+              BSS: Iterator<Item=&'b BackingStore>,
+    {
+        // An important assertion about this function's parameters is that the sum of all blocks' lengths and all backing stores' lengths must be equal.
+        // That means that we will __always__ be able to pull a block from the iterator if we need it to fill a backing store, and conversely, we will always be able to find a backing store for a block's remaining data.
+        // Just for giggles we also assume that the caller isn't so mentally retarded to pass BOTH empty iterators to the function.
+        let mut blk = blocks.next().unwrap();
+        let mut blk_start = 0;
+        let mut bs = backing_stores.next().unwrap();
+        let mut bs_start = 0;
+        let mut retval = Vec::new();
+        loop {
+            let blkspace = blk.data.len() - blk_start;
+            let bsspace = bs.len - bs_start;
+            match blkspace.cmp(&bsspace) {
+                Ordering::Less => {
+                    retval.push(Self{blk, blk_start, bs, bs_start, len: blkspace});
+                    bs_start += blkspace;
+                    blk_start = 0;
+                    blk = blocks.next().unwrap();
+                }
+                Ordering::Greater => {
+                    retval.push(Self{blk, blk_start, bs, bs_start, len: bsspace});
+                    blk_start += bsspace;
+                    bs_start = 0;
+                    bs = backing_stores.next().unwrap();
+                }
+                Ordering::Equal => {
+                    retval.push(Self{blk, blk_start, bs, bs_start, len: blkspace});
+                    // Either iterator having remaining elements implies BOTH iterators have elements.
+                    (blk, bs) = match (blocks.next(), backing_stores.next()) {
+                        (Some(blk), Some(bs)) => (blk, bs),
+                        (None, None) => break,
+                        _ => panic!("Block-iterator and BackingStore-iterator are incompatible."),
+                    };
+                    blk_start = 0;
+                    bs_start = 0;
+                }
+            }
+        }
+        retval
     }
 }
 
@@ -126,8 +165,6 @@ enum PMEvent {
     TorrentMasterCmd,
     PeerSocketReady4Read,
 }
-
-static MAX_BLOCKS_IN_FLIGHT : u32 = 10;
 
 fn next_requestable_block(unstarted_piece_queue: &mut VecDeque<Piece>, pieces_in_flight: &mut Vec<PieceInFlight>) -> Option<(u32, u32, u32)> {
     /// Looks for the next block that can be requested.
@@ -163,14 +200,6 @@ fn next_requestable_block(unstarted_piece_queue: &mut VecDeque<Piece>, pieces_in
     }
     None
 }
-
-// fn torrent_master(torrent: Torrent) {
-//     let mut peers_unconn = Vec::<Peer>::new();
-//     // FAKE acquire peers
-//     peers_conn.push(Some(Peer::new("localhost:6969")));
-//     peers_conn.push(Some(Peer::new("localhost:6970")));
-//
-// }
 
 fn get_next_event(epoll_instance: c_int, sock_fd: c_int, eventfd_fd: c_int) -> PMEvent { unsafe {
     eprintln!("Entered GET_NEXT_EVENT.");
@@ -295,12 +324,15 @@ fn peer_master(mut sock: TcpStream, mut orders_in: Receiver<TM2PMCmd>, orders_in
                             let computed_hash = hasher.digest().bytes();
                             assert_eq!(published_hash, computed_hash);  // TODO Very robust error-handling. Lmao.
                             // Write to disk
-                            let fd = piece_in_flight.piece.fd;
-                            let base_offset = piece_in_flight.piece.offset;
-                            for block in &piece_in_flight.ready_blks {
-                                let res = pwrite(fd, &block.data, (base_offset + block.begin as usize) as off_t);
-                                assert_ne!(res, -1);   // TODO Very robust error-handling. Lmao.
-                            }
+
+                            // UNIMPLEMENTED NEEDS REWORK!!!!!!
+            // let fd = piece_in_flight.piece.fd;
+            // let base_offset = piece_in_flight.piece.offset;
+            // for block in &piece_in_flight.ready_blks {
+                pwrite(fd, &block.data, (base_offset + block.begin as usize) as off_t).unwrap();
+            // }
+                            // UNIMPLEMENTED NEEDS REWORK!!!!!!
+
                             // Mark the piece as complete. Also, inform the Torrent Master.
                             results_out.send(PM2TMResult::FinishedDownloadingPiece(piece_idx)).unwrap();
                             dl_pieces_in_flight.swap_remove(piece_in_flight_pos);  // This will drop all buffers for this piece.
@@ -334,25 +366,26 @@ fn peer_master(mut sock: TcpStream, mut orders_in: Receiver<TM2PMCmd>, orders_in
     }
 }
 
-
 fn main ()  { unsafe {
     let mut s = TcpStream::connect("127.0.0.1:6969").unwrap();
     let mut destfile = OpenOptions::new().write(true).truncate(true).create(true).open("/tmp/plswork").unwrap();
-    let mut pieces = Vec::new();
     let torrent = Torrent::new_dr_paul();
-
+    let mut pieces = Vec::new();
     for i in 0..199 {
         pieces.push(Piece{
             piece_idx: i,
-            piece_len: min(torrent.piece_length, (torrent.file_length - (i * torrent.piece_length) as u64) as u32),
-            offset: (i * torrent.piece_length) as usize,
-            fd: destfile.as_raw_fd(),
+            piece_len: min(torrent.piece_length, (torrent.vfile_length - (i * torrent.piece_length) as u64) as u32),
+            backing_stores: vec![BackingStore{
+                fd: destfile.as_raw_fd(),
+                offset: (i * torrent.piece_length) as usize,
+                len: min(torrent.piece_length as usize, (torrent.vfile_length - (i * torrent.piece_length) as u64) as usize),
+            }],
             piece_hash: torrent.nth_hash(i as usize).try_into().unwrap()
         })
     }
 
-    send_handshake(&torrent.info_hash, &mut s).unwrap();
-    recv_and_check_handshake(&torrent.info_hash, None, &mut s).unwrap();
+    BtMsg::send_handshake(&torrent.info_hash, &mut s).unwrap();
+    BtMsg::recv_and_check_handshake(&torrent.info_hash, None, &mut s).unwrap();
 
     let (tm2pm_send, tm2pm_recv) = channel();
     let (pm2tm_send, pm2tm_recv) = channel();
@@ -373,102 +406,3 @@ fn main ()  { unsafe {
     return ();
 }}
 
-pub fn pread(fd: RawFd, buf: &mut [u8], offset: off_t) -> ssize_t {
-    unsafe {
-        libc::pread(fd, buf.as_mut_ptr() as *mut c_void, buf.len() as size_t, offset)
-    }
-}
-
-pub fn pwrite(fd: RawFd, buf: &[u8], offset: off_t) -> ssize_t {
-    unsafe {
-        libc::pwrite(fd, buf.as_ptr() as *const c_void, buf.len() as size_t, offset)
-    }
-}
-
-// CUTTING FLOOR
-
-// let mut recv_buf  : Vec<u8> = Vec::new();  // VARIABLE IS LOGICALLY UNINITIALIZED!
-// // The following variable is interpreted as follows:
-// // if non-zero, we were reading from the socket, determined we had to read N bytes, and need to pull `val` more bytes to finish.
-// // if zero, we are reading the first bytes of a new transaction
-// let mut read_remaining : usize = 0;
-// ......................wordswordswords......................
-// // HANDLING THIS EVENT CAN PRODUCE 0 OR 1 BTMSGS THAT WE HAVE TO HANDLE.
-//
-// // Are we picking up from assembling a BtMsg from various frames, or are we starting anew?
-// if read_remaining == 0 {
-//     // We are starting anew.
-//     let msglen : u32 = {
-//         let mut buf = [0u8;4];
-//         sock.read_exact(buf.as_mut_slice()).unwrap(); // sock assumed to be nonblocking and if we don't have 4 bytes ready to read, fuck off.
-//         u32::from_be_bytes(buf)
-//     };
-//     if msglen == 0 {
-//         btmsg = BtMsg::KeepAlive;
-//         read_remaining = 0;  // Unnecessary; for clarity.
-//         continue;
-//     } else {
-//         recv_buf = vec![0u8; msglen as usize];
-//         read_remaining = msglen as usize;
-//         let read_so_far = recv_buf.len() - read_remaining;
-//         let nread = sock.read(&mut recv_buf[read_so_far..]).unwrap();
-//         read_remaining -= nread;
-//     }
-// } else {
-//     let read_so_far = recv_buf.len() - read_remaining;
-//     let nread = sock.read(&mut recv_buf[read_so_far..]).unwrap();
-//     read_remaining -= nread;
-// }
-//
-// // We've definitely done some work receiving a BtMsg; read_remaining == 0 now definitely indicates a complete packet is ready in recv_buf.
-// if read_remaining == 0 {
-
-
-//    let mut piece = 0;
-//     loop {
-//         if piece == 198 { break; }
-//
-//         BtMsg::BlockRequest {
-//             piece_idx: piece,
-//             begin: 0,
-//             length: 0x4000,
-//         }.serialize(&mut s).unwrap();
-//         BtMsg::BlockRequest {
-//             piece_idx: piece,
-//             begin: 0x4000,
-//             length: 0x4000,
-//         }.serialize(&mut s).unwrap();
-//         piece += 1;
-//
-//         let msg_recvd = BtMsg::deserialize(&mut s).unwrap();
-//         match &msg_recvd {
-//             BtMsg::BlockResponse {piece_idx, begin, data} => {
-//                 let start = piece_idx * 0x8000 + begin;
-//                 let end = start + 0x4000;
-//                 (&mut buf4file[start as _..end as _]).copy_from_slice(data.as_slice());
-//                 if *begin == 0x4000 { ask_for_more = true; }
-//             },
-//             _ => {}
-//         }
-//         let msg_recvd = BtMsg::deserialize(&mut s).unwrap();
-//         match &msg_recvd {
-//             BtMsg::BlockResponse {piece_idx, begin, data} => {
-//                 let start = piece_idx * 0x8000 + begin;
-//                 let end = start + 0x4000;
-//                 (&mut buf4file[start as _..end as _]).copy_from_slice(data.as_slice());
-//                 if *begin == 0x4000 { ask_for_more = true; }
-//             },
-//             _ => {}
-//         }
-//     }
-//     // Last piece
-//     BtMsg::BlockRequest {
-//         piece_idx: 198,
-//         begin: 0,
-//         length: 2605,
-//     }.serialize(&mut s).unwrap();
-//     if let BtMsg::BlockResponse {piece_idx, begin, data} = BtMsg::deserialize(&mut s).unwrap() {
-//         let start = 198 * 0x8000;
-//         let end = start + 2605;
-//         (&mut buf4file[start as _..end as _]).copy_from_slice(data.as_slice());
-//     }

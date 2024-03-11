@@ -67,35 +67,35 @@ pub enum BtPeerMsgDecodeError {
 
 static HANDSHAKE_TMPL : &[u8] = include_bytes!("../assets/handshake-template").as_slice();  // Is a &[u8] of length 49+19; it is pre-filled with the entire handshake except for the 20 bytes that correspond to the torrent's info_hash and which must be filled in.
 
-pub fn send_handshake<W: std::io::Write>(info_hash: &[u8], mut data_stream: W) -> io::Result<()> {
-    assert_eq!(info_hash.len(), 20);
-    let mut handshake_buf = [0u8; 49 + 19];  // "The handshake is [...] 49+19 bytes long." from btspecification
-    let handshake_tmpl = HANDSHAKE_TMPL;
-    handshake_buf.copy_from_slice(handshake_tmpl);
-    let mut info_hash_slice = &mut handshake_buf[28..48];  // I fucking hope my math is right.
-    info_hash_slice.copy_from_slice(info_hash);
-
-    data_stream.write_all(handshake_buf.as_slice())
-}
-
-pub fn recv_and_check_handshake<R: std::io::Read>(expected_info_hash: &[u8], expected_peer_id: Option<&[u8]>, mut data_stream: R) -> io::Result<()> {  // TODO: WRONG ERROR KIND
-    assert_eq!(expected_info_hash.len(), 20);
-    // TODO: THE REST OF THE assert_eq!()s IN THIS FUNCTION HAVE TO BE REPLACED BY SOMETHING THAT RETURNS AN ERROR TO THE CALLER INSTEAD.
-    let mut handshake_buf = [0u8; 49 + 19];  // "The handshake is [...] 49+19 bytes long." from btspecification
-    data_stream.read_exact(handshake_buf.as_mut_slice())?;
-    let handshake_tmpl = HANDSHAKE_TMPL;
-    assert_eq!(&handshake_tmpl[..20], &handshake_buf[..20]);  // The len(pstr) byte and the pstr are a fixed part of the protocol
-    {} // I don't know any sane way to the validity of the 8 reserved bytes yet.
-    assert_eq!(expected_info_hash, &handshake_buf[28..48]);
-    if let Some(expected_peer_id) = expected_peer_id {
-        assert_eq!(expected_peer_id, &handshake_buf[48..]);
-    }
-
-    Ok(())
-}
-
 
 impl BtMsg {
+    pub fn send_handshake<W: std::io::Write>(info_hash: &[u8], mut data_stream: W) -> io::Result<()> {
+        assert_eq!(info_hash.len(), 20);
+        let mut handshake_buf = [0u8; 49 + 19];  // "The handshake is [...] 49+19 bytes long." from btspecification
+        let handshake_tmpl = HANDSHAKE_TMPL;
+        handshake_buf.copy_from_slice(handshake_tmpl);
+        let mut info_hash_slice = &mut handshake_buf[28..48];  // I fucking hope my math is right.
+        info_hash_slice.copy_from_slice(info_hash);
+
+        data_stream.write_all(handshake_buf.as_slice())
+    }
+
+    pub fn recv_and_check_handshake<R: std::io::Read>(expected_info_hash: &[u8], expected_peer_id: Option<&[u8]>, mut data_stream: R) -> io::Result<()> {  // TODO: WRONG ERROR KIND
+        assert_eq!(expected_info_hash.len(), 20);
+        // TODO: THE REST OF THE assert_eq!()s IN THIS FUNCTION HAVE TO BE REPLACED BY SOMETHING THAT RETURNS AN ERROR TO THE CALLER INSTEAD.
+        let mut handshake_buf = [0u8; 49 + 19];  // "The handshake is [...] 49+19 bytes long." from btspecification
+        data_stream.read_exact(handshake_buf.as_mut_slice())?;
+        let handshake_tmpl = HANDSHAKE_TMPL;
+        assert_eq!(&handshake_tmpl[..20], &handshake_buf[..20]);  // The len(pstr) byte and the pstr are a fixed part of the protocol
+        {} // I don't know any sane way to the validity of the 8 reserved bytes yet.
+        assert_eq!(expected_info_hash, &handshake_buf[28..48]);
+        if let Some(expected_peer_id) = expected_peer_id {
+            assert_eq!(expected_peer_id, &handshake_buf[48..]);
+        }
+
+        Ok(())
+    }
+
     pub fn deserialize<R: std::io::Read>(mut data_stream: R) -> Result<Self, BtPeerMsgDecodeError> {
         let msg_len: u32 = dsrlz!(&mut data_stream, u32)?;
         if msg_len == 0 {

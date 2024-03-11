@@ -12,5 +12,7 @@ num-derive = "*"
 num-traits = "*"
 hex-literal = "*"
 itertools = "*"
-sha1_smol = "*"
+sha1_smol = "*"  # "rustcrypto" is a bit of a mess and @newpavlov and especially @tarcieri came across as a bit of an asshole about the project naming stuff. See https://github.com/RustCrypto/traits/issues/102 and https://github.com/stainless-steel/md5/pull/2
 libc = "*"
+nix = {version = "*", features = ["uio"]}
+drizzle-bencode = { path = "/home/daniel/CLionProjects/drizzle-bencode", version = "*"}
